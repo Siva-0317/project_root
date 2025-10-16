@@ -1,7 +1,13 @@
 # app/main.py
-import os, json, httpx, logging
+import os
+import json
+import httpx
+import logging
+import tempfile
+import subprocess
 from typing import List
 from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -9,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from faster_whisper import WhisperModel
+
 from app.settings import settings
 
 # --------- JUNE system prompt (server-side canonical) ---------
@@ -65,24 +72,30 @@ Policy:
 - Be concise, friendly, and clear; include links from Digital Access only when helpful.
 """
 
+# ---------- Config ----------
 DB_URL: str = settings.DB_URL
-LM_BASE: str = settings.LM_BASE
+LM_BASE: str = settings.LM_BASE  # e.g., http://127.0.0.1:1234
 LM_CHAT: str = f"{LM_BASE}/v1/chat/completions"
 
 def _parse_origins(origins: str) -> List[str]:
-    if not origins or origins.strip() == "*": return ["*"]
+    if not origins or origins.strip() == "*":
+        return ["*"]
     return [o.strip() for o in origins.split(",") if o.strip()]
 
 CORS_ORIGINS = _parse_origins(settings.CORS_ORIGIN)
 
+# ---------- DB (pooled) ----------
 engine = create_engine(DB_URL, pool_size=10, max_overflow=20, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
+# ---------- App ----------
 app = FastAPI(title="JUNE Library Assistant API")
 app.add_middleware(
     CORSMiddleware,
@@ -92,22 +105,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional local static serving (for local dev)
 static_dir = Path(__file__).resolve().parent.parent / "static"
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-@app.get("/")
-def login_page():
-    return FileResponse(str(static_dir / "login.html"))
+    @app.get("/")
+    def login_page():
+        return FileResponse(str(static_dir / "login.html"))
 
-@app.get("/chat")
-def chat_page():
-    return FileResponse(str(static_dir / "chat.html"))
+    @app.get("/chat")
+    def chat_page():
+        return FileResponse(str(static_dir / "chat.html"))
 
 log = logging.getLogger("uvicorn.error")
 
-# STT model (Windows-safe compute default; override with WH_* in .env)
-stt = WhisperModel(settings.WHISPER_SIZE, device=settings.WH_DEVICE, compute_type=os.getenv("WH_COMPUTE_TYPE", "int8"))
+# ---------- Whisper STT ----------
+stt = WhisperModel(
+    settings.WHISPER_SIZE,
+    device=settings.WH_DEVICE,
+    compute_type=os.getenv("WH_COMPUTE_TYPE", "int8"),
+)
 
+# ---------- Health ----------
 @app.get("/health/db")
 def health_db(db=Depends(get_db)):
     db.execute(text("SELECT 1"))
@@ -123,9 +143,10 @@ def health_lm():
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LM server check failed: {e}")
 
+# ---------- Auth & History ----------
 @app.post("/api/login")
 def login(body: dict, db=Depends(get_db)):
-    reg = str(body.get("reg_no","")).strip()
+    reg = str(body.get("reg_no", "")).strip()
     row = db.execute(text("SELECT name, dept FROM students WHERE reg_no=:r"), {"r": reg}).fetchone()
     if not row:
         return {"ok": False, "msg": "Invalid register number"}
@@ -137,25 +158,70 @@ def logout():
 
 @app.get("/api/history")
 def history(reg_no: str, db=Depends(get_db)):
-    rows = db.execute(text("SELECT message, timestamp FROM history WHERE reg_no=:r ORDER BY timestamp DESC LIMIT 20"), {"r": reg_no}).fetchall()
+    rows = db.execute(
+        text("SELECT message, timestamp FROM history WHERE reg_no=:r ORDER BY timestamp DESC LIMIT 20"),
+        {"r": reg_no},
+    ).fetchall()
     return {"items": [{"message": r[0], "timestamp": r[1].isoformat()} for r in rows]}
 
-# Windows-safe temp file handling for WebM uploads
+# ---------- STT (robust: direct decode, then ffmpeg fallback) ----------
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     data = await file.read()
-    import tempfile, os
-    fd, path = tempfile.mkstemp(suffix=".webm")
+    if not data or len(data) < 2000:
+        raise HTTPException(status_code=400, detail="Empty/too-short audio")
+
+    # Determine extension from content-type or filename
+    ctype = (file.content_type or "").lower()
+    fname = (file.filename or "").lower()
+    ext = ".webm"
+    if "ogg" in ctype or fname.endswith(".ogg"):
+        ext = ".ogg"
+    elif "wav" in ctype or fname.endswith(".wav"):
+        ext = ".wav"
+    elif "mp4" in ctype or "m4a" in ctype or fname.endswith(".m4a"):
+        ext = ".m4a"
+
+    fd, src = tempfile.mkstemp(suffix=ext)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        segments, _ = stt.transcribe(path, vad_filter=True, beam_size=1)
+
+        # 1) Try direct decode via PyAV
+        try:
+            segments, _ = stt.transcribe(src, vad_filter=True, beam_size=1)
+            text = "".join(s.text for s in segments).strip()
+            if text:
+                return {"text": text}
+        except Exception:
+            pass  # go to ffmpeg fallback
+
+        # 2) Fallback: ffmpeg to 16 kHz mono wav
+        wav = src + ".wav"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", src, "-ac", "1", "-ar", "16000", "-f", "wav", wav
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Audio decode failed; install ffmpeg and ensure it's on PATH. Error: {e}"
+            )
+
+        segments, _ = stt.transcribe(wav, vad_filter=True, beam_size=1)
         text = "".join(s.text for s in segments).strip()
         return {"text": text}
     finally:
-        try: os.remove(path)
-        except OSError: pass
+        # cleanup
+        for p in (src, src + ".wav"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
+# ---------- Chat (WebSocket streaming) ----------
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket):
     await ws.accept()
@@ -163,26 +229,27 @@ async def ws_chat(ws: WebSocket):
         async with httpx.AsyncClient(timeout=None) as client:
             while True:
                 msg = await ws.receive_json()
-                reg_no = str(msg.get("reg_no","")).strip()
-                user_msg = str(msg.get("content",""))
-                model_id = msg.get("model","llama-3.2-3b-instruct")
+                reg_no = str(msg.get("reg_no", "")).strip()
+                user_msg = str(msg.get("content", ""))
+                model_id = msg.get("model", "llama-3.2-3b-instruct")
 
                 if not reg_no or not user_msg:
-                    await ws.send_json({"event":"error","text":"Missing reg_no or content"})
+                    await ws.send_json({"event": "error", "text": "Missing reg_no or content"})
                     continue
 
-                # Always inject the canonical JUNE prompt server-side
                 messages = [
                     {"role": "system", "content": PROMPT_JUNE},
-                    {"role": "user",   "content": user_msg},
+                    {"role": "user", "content": user_msg},
                 ]
                 payload = {"model": model_id, "messages": messages, "stream": True}
 
                 # Save user message
                 try:
                     with engine.begin() as conn:
-                        conn.execute(text("INSERT INTO history (reg_no, message, timestamp) VALUES (:r,:m,NOW())"),
-                                     {"r": reg_no, "m": f"User: {user_msg}"})
+                        conn.execute(
+                            text("INSERT INTO history (reg_no, message, timestamp) VALUES (:r,:m,NOW())"),
+                            {"r": reg_no, "m": f"User: {user_msg}"},
+                        )
                 except Exception as e:
                     log.error(f"DB insert (user) failed: {e}")
 
@@ -191,33 +258,37 @@ async def ws_chat(ws: WebSocket):
                     async with client.stream("POST", LM_CHAT, json=payload) as r:
                         if r.status_code != 200:
                             body = await r.aread()
-                            await ws.send_json({"event":"error","text":f"LM error {r.status_code}: {body.decode('utf-8','ignore')}"})
+                            await ws.send_json({"event": "error", "text": f"LM error {r.status_code}: {body.decode('utf-8','ignore')}"})
                             continue
                         async for line in r.aiter_lines():
-                            if not line or line.startswith(":"): continue
-                            if not line.startswith("data:"): continue
+                            if not line or line.startswith(":"):
+                                continue
+                            if not line.startswith("data:"):
+                                continue
                             data = line[5:].strip()
                             if data == "[DONE]":
-                                await ws.send_json({"event":"done"})
+                                await ws.send_json({"event": "done"})
                                 break
                             try:
                                 obj = json.loads(data)
-                                delta = obj["choices"][0]["delta"].get("content","")
+                                delta = obj["choices"][0]["delta"].get("content", "")
                                 if delta:
                                     buffer.append(delta)
-                                    await ws.send_json({"event":"token","text":delta})
+                                    await ws.send_json({"event": "token", "text": delta})
                             except Exception:
                                 pass
                 except Exception as e:
-                    await ws.send_json({"event":"error","text":f"Stream failed: {e}"})
+                    await ws.send_json({"event": "error", "text": f"Stream failed: {e}"})
                     continue
 
                 final = "".join(buffer).strip()
                 if final:
                     try:
                         with engine.begin() as conn:
-                            conn.execute(text("INSERT INTO history (reg_no, message, timestamp) VALUES (:r,:m,NOW())"),
-                                         {"r": reg_no, "m": f"Assistant: {final}"})
+                            conn.execute(
+                                text("INSERT INTO history (reg_no, message, timestamp) VALUES (:r,:m,NOW())"),
+                                {"r": reg_no, "m": f"Assistant: {final}"},
+                            )
                     except Exception as e:
                         log.error(f"DB insert (assistant) failed: {e}")
     except WebSocketDisconnect:

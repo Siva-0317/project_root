@@ -50,184 +50,199 @@
   </footer>
 
   <script>
-document.addEventListener('DOMContentLoaded', () => {
-  (async () => {
-    // ---------- Config ----------
-    const API_BASE = 'https://employees-board-diagnostic-thee.trycloudflare.com';
-    const WS_BASE  = 'wss://employees-board-diagnostic-thee.trycloudflare.com';
+  document.addEventListener('DOMContentLoaded', () => {
+    (async () => {
+      // Replace with your current Cloudflare Tunnel URL
+      const API_BASE = 'https://employees-board-diagnostic-thee.trycloudflare.com';
+      const WS_BASE  = 'wss://employees-board-diagnostic-thee.trycloudflare.com';
 
-    // ---------- Session ----------
-    const reg_no = sessionStorage.getItem('reg_no');
-    const name   = sessionStorage.getItem('name');
-    if (!reg_no || !name) { location.href = '/'; return; }
+      // Session
+      const reg_no = sessionStorage.getItem('reg_no');
+      const name   = sessionStorage.getItem('name');
+      if (!reg_no || !name){ location.href = '/'; return; }
 
-    // ---------- DOM ----------
-    const who = document.getElementById('who');
-    const statusEl = document.getElementById('status');
-    const chat = document.getElementById('chat');
-    const qEl = document.getElementById('q');
-    const sendBtn = document.getElementById('send');
-    const micBtn = document.getElementById('mic');
-    const logoutBtn = document.getElementById('logout');
-    const stopBtn = document.getElementById('stopSpeech');
+      // DOM
+      const who = document.getElementById('who');
+      const statusEl = document.getElementById('status');
+      const chat = document.getElementById('chat');
+      const qEl = document.getElementById('q');
+      const sendBtn = document.getElementById('send');
+      const micBtn = document.getElementById('mic');
+      const logoutBtn = document.getElementById('logout');
+      const stopBtn = document.getElementById('stopSpeech');
 
-    if (!who || !statusEl || !chat || !qEl || !sendBtn || !micBtn || !logoutBtn || !stopBtn) {
-      document.body.innerHTML = '<div style="padding:16px;color:#b91c1c">Chat UI not found. Check that /chat is serving chat.html via vercel.json rewrites.</div>';
-      return;
-    }
-
-    function setStatus(t) { statusEl.textContent = t; }
-    function addMsg(role, text) {
-      const div = document.createElement('div'); div.className = 'msg ' + role;
-      const b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
-      div.appendChild(b); chat.appendChild(div); chat.scrollTop = chat.scrollHeight;
-    }
-
-    who.textContent = `Logged in as ${name} (${reg_no})`;
-    console.log('init', { API_BASE, WS_BASE, reg_no, name });
-
-    // ---------- TTS (ordered definitions) ----------
-    const synth = window.speechSynthesis;
-    function voicesReady() {
-      return new Promise((resolve) => {
-        const v = synth.getVoices();
-        if (v && v.length) return resolve();
-        const handler = () => {
-          const vv = synth.getVoices();
-          if (vv && vv.length) {
-            synth.removeEventListener('voiceschanged', handler);
-            resolve();
-          }
-        };
-        synth.addEventListener('voiceschanged', handler);
-        setTimeout(handler, 100);
-      });
-    }
-    function pickFemaleVoice() {
-      const vs = synth.getVoices(); if (!vs || !vs.length) return null;
-      const prefer = ["Microsoft Zira","Google UK English Female","Google US English","Samantha","Victoria","Karen"];
-      for (const n of prefer) { const v = vs.find(v => v.name.includes(n)); if (v) return v; }
-      const en = vs.filter(v => /^en[-_]/i.test(v.lang));
-      const hint = /(female|zira|samantha|victoria|karen)/i;
-      const hinted = en.find(v => hint.test(v.name));
-      return hinted || en[0] || vs[0];
-    }
-
-    const TTS = { voice:null, buffer:"", spokenLen:0, timer:null, active:false, stopped:false };
-
-    async function ensureVoice() {
-      try {
-        await voicesReady();
-        const saved = sessionStorage.getItem('voice_name');
-        const vs = synth.getVoices();
-        let chosen = null;
-        if (saved) chosen = vs.find(v => v.name === saved) || null;
-        if (!chosen) chosen = pickFemaleVoice();
-        TTS.voice = chosen;
-        if (chosen) sessionStorage.setItem('voice_name', chosen.name);
-        console.log('voice', TTS.voice && TTS.voice.name);
-      } catch (e) { console.warn('voice error', e); }
-    }
-
-    function ttsStartNewAnswer(){ synth.cancel(); TTS.buffer=""; TTS.spokenLen=0; TTS.active=true; TTS.stopped=false; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } }
-    function ttsOnToken(text){ if (!TTS.active || TTS.stopped) return; TTS.buffer+=text; if (TTS.timer) clearTimeout(TTS.timer); TTS.timer=setTimeout(ttsFlush,300); }
-    function ttsFlush(){ if (!TTS.active || TTS.stopped) return; if (TTS.buffer.length<=TTS.spokenLen) return; const chunk=TTS.buffer.slice(TTS.spokenLen); TTS.spokenLen=TTS.buffer.length; const utt=new SpeechSynthesisUtterance(chunk); if (TTS.voice) utt.voice=TTS.voice; utt.rate=1.05; utt.pitch=1.1; synth.speak(utt); }
-    function ttsDone(){ if (!TTS.active) return; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } if (!TTS.stopped) ttsFlush(); TTS.active=false; }
-    function ttsStopNow(){ TTS.stopped=true; TTS.active=false; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } synth.cancel(); }
-
-    stopBtn.addEventListener('click', ttsStopNow);
-
-    // ---------- Voice ready then WS/connect/buttons ----------
-    await ensureVoice();
-
-    // WebSocket
-    let ws = null;
-    function connectWS() {
-      try {
-        ws = new WebSocket(`${WS_BASE}/ws/chat`);
-        ws.onopen = ()=> setStatus('WS connected');
-        ws.onclose = ()=> setStatus('WS closed');
-        ws.onerror = (e)=> { setStatus('WS error'); console.warn('ws error', e); };
-        ws.onmessage = (ev)=> {
-          try {
-            const m = JSON.parse(ev.data);
-            if (m.event === 'token') {
-              const last = chat.lastElementChild;
-              if (last && last.classList.contains('assistant')) {
-                last.querySelector('.bubble').textContent += m.text;
-              } else {
-                addMsg('assistant', m.text);
-              }
-              ttsOnToken(m.text);
-            } else if (m.event === 'done') {
-              ttsDone();
-            } else if (m.event === 'error') {
-              addMsg('assistant', `Error: ${m.text}`);
-            }
-          } catch (e) { console.warn('ws msg parse', e); }
-        };
-      } catch (e) {
-        setStatus('WS init failed'); console.error('ws init failed', e);
+      if (!who || !statusEl || !chat || !qEl || !sendBtn || !micBtn || !logoutBtn || !stopBtn) {
+        document.body.innerHTML = '<div style="padding:16px;color:#b91c1c">Chat UI not found. Check vercel.json rewrites for /chat → /chat.html.</div>';
+        return;
       }
-    }
-    connectWS();
 
-    // Greeting (safe even if voice missing)
-    try {
-      ttsStartNewAnswer();
-      const welcome = `Welcome, ${name}. How can I help you today?`;
-      addMsg('assistant', welcome);
-      ttsOnToken(welcome); ttsDone();
-    } catch (e) { console.warn('greet error', e); }
+      function setStatus(t) { statusEl.textContent = t; }
+      function addMsg(role, text) {
+        const div = document.createElement('div'); div.className = 'msg ' + role;
+        const b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+        div.appendChild(b); chat.appendChild(div); chat.scrollTop = chat.scrollHeight;
+      }
 
-    // Send
-    function sendPrompt(text){
-      if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-      addMsg('user', text);
-      addMsg('assistant', '');
-      ttsStartNewAnswer();
+      who.textContent = `Logged in as ${name} (${reg_no})`;
+      console.log('init', { API_BASE, WS_BASE, reg_no, name });
+
+      // ---- TTS ----
+      const synth = window.speechSynthesis;
+      function voicesReady() {
+        return new Promise((resolve) => {
+          const v = synth.getVoices();
+          if (v && v.length) return resolve();
+          const handler = () => {
+            const vv = synth.getVoices();
+            if (vv && vv.length) { synth.removeEventListener('voiceschanged', handler); resolve(); }
+          };
+          synth.addEventListener('voiceschanged', handler);
+          setTimeout(handler, 100);
+        });
+      }
+      function pickFemaleVoice() {
+        const vs = synth.getVoices(); if (!vs || !vs.length) return null;
+        const prefer = ["Microsoft Zira","Google UK English Female","Google US English","Samantha","Victoria","Karen"];
+        for (const n of prefer) { const v = vs.find(v => v.name.includes(n)); if (v) return v; }
+        const en = vs.filter(v => /^en[-_]/i.test(v.lang));
+        const hint = /(female|zira|samantha|victoria|karen)/i;
+        const hinted = en.find(v => hint.test(v.name));
+        return hinted || en[0] || vs[0];
+      }
+      const TTS = { voice:null, buffer:"", spokenLen:0, timer:null, active:false, stopped:false };
+      async function ensureVoice() {
+        try {
+          await voicesReady();
+          const saved = sessionStorage.getItem('voice_name');
+          const vs = synth.getVoices();
+          let chosen = null;
+          if (saved) chosen = vs.find(v => v.name === saved) || null;
+          if (!chosen) chosen = pickFemaleVoice();
+          TTS.voice = chosen;
+          if (chosen) sessionStorage.setItem('voice_name', chosen.name);
+          console.log('voice', TTS.voice && TTS.voice.name);
+        } catch (e) { console.warn('voice error', e); }
+      }
+      function ttsStartNewAnswer(){ synth.cancel(); TTS.buffer=""; TTS.spokenLen=0; TTS.active=true; TTS.stopped=false; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } }
+      function ttsOnToken(text){ if (!TTS.active || TTS.stopped) return; TTS.buffer+=text; if (TTS.timer) clearTimeout(TTS.timer); TTS.timer=setTimeout(ttsFlush,300); }
+      function ttsFlush(){ if (!TTS.active || TTS.stopped) return; if (TTS.buffer.length<=TTS.spokenLen) return; const chunk=TTS.buffer.slice(TTS.spokenLen); TTS.spokenLen=TTS.buffer.length; const utt=new SpeechSynthesisUtterance(chunk); if (TTS.voice) utt.voice=TTS.voice; utt.rate=1.05; utt.pitch=1.1; synth.speak(utt); }
+      function ttsDone(){ if (!TTS.active) return; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } if (!TTS.stopped) ttsFlush(); TTS.active=false; }
+      function ttsStopNow(){ TTS.stopped=true; TTS.active=false; if (TTS.timer){ clearTimeout(TTS.timer); TTS.timer=null; } synth.cancel(); }
+      stopBtn.addEventListener('click', ttsStopNow);
+
+      await ensureVoice();
+
+      // ---- WebSocket ----
+      let ws = null;
+      function connectWS() {
+        try {
+          ws = new WebSocket(`${WS_BASE}/ws/chat`);
+          ws.onopen = ()=> setStatus('WS connected');
+          ws.onclose = ()=> setStatus('WS closed');
+          ws.onerror = (e)=> { setStatus('WS error'); console.warn('ws error', e); };
+          ws.onmessage = (ev)=> {
+            try {
+              const m = JSON.parse(ev.data);
+              if (m.event === 'token') {
+                const last = chat.lastElementChild;
+                if (last && last.classList.contains('assistant')) {
+                  last.querySelector('.bubble').textContent += m.text;
+                } else {
+                  addMsg('assistant', m.text);
+                }
+                ttsOnToken(m.text);
+              } else if (m.event === 'done') {
+                ttsDone();
+              } else if (m.event === 'error') {
+                addMsg('assistant', `Error: ${m.text}`);
+              }
+            } catch (e) { console.warn('ws msg parse', e); }
+          };
+        } catch (e) { setStatus('WS init failed'); console.error('ws init failed', e); }
+      }
+      connectWS();
+
+      // ---- Greeting ----
       try {
-        ws.send(JSON.stringify({ reg_no, content: text, model: 'llama-3.2-3b-instruct' }));
-      } catch (e) { console.warn('ws send error', e); }
-    }
-    sendBtn.addEventListener('click', ()=>{ const t=qEl.value.trim(); sendPrompt(t); qEl.value=''; });
-    qEl.addEventListener('keydown', (e)=>{ if (e.key==='Enter'){ sendBtn.click(); } });
+        ttsStartNewAnswer();
+        const welcome = `Welcome, ${name}. How can I help you today?`;
+        addMsg('assistant', welcome);
+        ttsOnToken(welcome); ttsDone();
+      } catch (e) { console.warn('greet error', e); }
 
-    // Mic (hold)
-    let rec=null, chunks=[];
-    micBtn.addEventListener('mousedown', async ()=>{
-      try{
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-        chunks = [];
-        rec.ondataavailable = e => chunks.push(e.data);
-        rec.onstop = async ()=>{
-          try{
-            const blob = new Blob(chunks, { type:'audio/webm' });
-            const fd = new FormData(); fd.append('file', blob, 'audio.webm');
-            const j = await fetch(`${API_BASE}/api/transcribe`, { method:'POST', body: fd }).then(r=>r.json());
-            if (j.text){ qEl.value = j.text; sendBtn.click(); }
-          }catch(e){ console.warn('stt error', e); }
-        };
-        rec.start(300);
-      }catch(e){ console.warn('mic denied', e); }
-    });
-    function stopRec(){ if (rec && rec.state==='recording') rec.stop(); rec=null; }
-    micBtn.addEventListener('mouseup', stopRec);
-    micBtn.addEventListener('mouseleave', stopRec);
-    micBtn.addEventListener('touchstart',(e)=>{ e.preventDefault(); micBtn.dispatchEvent(new Event('mousedown')); }, {passive:false});
-    micBtn.addEventListener('touchend', (e)=>{ e.preventDefault(); stopRec(); }, {passive:false});
+      // ---- Send text ----
+      function sendPrompt(text){
+        if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+        addMsg('user', text);
+        addMsg('assistant', '');
+        ttsStartNewAnswer();
+        try {
+          ws.send(JSON.stringify({ reg_no, content: text, model: 'llama-3.2-3b-instruct' }));
+        } catch (e) { console.warn('ws send error', e); }
+      }
+      sendBtn.addEventListener('click', ()=>{ const t=qEl.value.trim(); sendPrompt(t); qEl.value=''; });
+      qEl.addEventListener('keydown', (e)=>{ if (e.key==='Enter'){ sendBtn.click(); } });
 
-    // Logout
-    logoutBtn.addEventListener('click', async ()=>{
-      try{ await fetch(`${API_BASE}/api/logout`, { method:'POST' }); }catch(e){}
-      sessionStorage.removeItem('reg_no'); sessionStorage.removeItem('name'); sessionStorage.removeItem('voice_name');
-      if (ws){ try{ ws.close(); }catch(e){} }
-      location.href = '/';
-    });
-  })();
-});
-</script>
+      // ---- Mic (hold) with codec selection ----
+      let rec = null, chunks = [], chosenMime = '';
 
+      function pickMime() {
+        const candidates = [
+          'audio/webm;codecs=opus',
+          'audio/ogg;codecs=opus',
+          'audio/webm',
+          'audio/mp4'
+        ];
+        for (const m of candidates) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) {
+            return m;
+          }
+        }
+        return '';
+      }
+
+      micBtn.addEventListener('mousedown', async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          chosenMime = pickMime();
+          rec = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+          chunks = [];
+          rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+          rec.onstop = async () => {
+            try {
+              const blob = new Blob(chunks, { type: chosenMime || 'audio/webm' });
+              let ext = 'webm';
+              if ((chosenMime || '').includes('ogg')) ext = 'ogg';
+              else if ((chosenMime || '').includes('mp4')) ext = 'm4a';
+
+              const fd = new FormData();
+              fd.append('file', blob, `audio.${ext}`);
+
+              const j = await fetch(`${API_BASE}/api/transcribe`, { method:'POST', body: fd }).then(r => r.json());
+              if (j.text) { qEl.value = j.text; sendBtn.click(); }
+            } catch (e) { console.warn('Transcribe upload error', e); }
+          };
+          rec.start(300);
+        } catch (e) {
+          console.warn('Mic denied/unavailable', e);
+        }
+      });
+
+      function stopRec() { if (rec && rec.state === 'recording') rec.stop(); rec = null; }
+      micBtn.addEventListener('mouseup', stopRec);
+      micBtn.addEventListener('mouseleave', stopRec);
+      micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); micBtn.dispatchEvent(new Event('mousedown')); }, { passive:false });
+      micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopRec(); }, { passive:false });
+
+      // ---- Logout ----
+      logoutBtn.addEventListener('click', async ()=>{
+        try{ await fetch(`${API_BASE}/api/logout`, { method:'POST' }); }catch(e){}
+        sessionStorage.removeItem('reg_no'); sessionStorage.removeItem('name'); sessionStorage.removeItem('voice_name');
+        if (ws){ try{ ws.close(); }catch(e){} }
+        location.href = '/';
+      });
+    })();
+  });
+  </script>
 </body>
 </html>

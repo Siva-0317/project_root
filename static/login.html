@@ -24,15 +24,15 @@
   </div>
 
   <script>
-    // Backend base (production)
-    const API_BASE = 'https://employees-board-diagnostic-thee.trycloudflare.com';   // e.g., https://api.june.example.com
-    const WS_BASE  = 'wss://employees-board-diagnostic-thee.trycloudflare.com';  // e.g., https://api.june.example.com
+    // Replace with your current Cloudflare Tunnel URL
+    const API_BASE = 'https://employees-board-diagnostic-thee.trycloudflare.com';
 
     const regEl = document.getElementById('reg');
     const loginBtn = document.getElementById('login');
     const toast = document.getElementById('toast');
 
     function show(t){ toast.textContent = t || ""; }
+
     loginBtn.addEventListener('click', async () => {
       const reg_no = regEl.value.trim();
       if (!reg_no){ show("Enter your register number"); return; }
@@ -46,7 +46,7 @@
         if (!j.ok){ show(j.msg || "Login failed"); return; }
         sessionStorage.setItem('reg_no', j.reg_no);
         sessionStorage.setItem('name', j.name);
-        location.href = '/chat';  // Vercel serves /static as root; chat.html at /chat (backend serves too if running locally)
+        location.href = '/chat';
       }catch(e){ show("Network error"); }
     });
   </script>
