@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>JUNE — Login</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { background:#fff7ed; font-family: system-ui, Segoe UI, Arial, sans-serif; margin:0; display:grid; place-items:center; height:100vh; }
+    .card { width: 360px; background:#fff; border-radius:12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 20px; }
+    h2 { margin: 0 0 8px; color:#92400e; }
+    p { margin: 6px 0 16px; color:#6b7280; font-size: 14px; }
+    input { width:100%; padding:10px; border:1px solid #e5e7eb; border-radius:8px; font-size:16px; }
+    button { width:100%; margin-top:12px; padding:10px; border-radius:8px; border:0; background:#d97706; color:#fff; font-size:16px; cursor:pointer; }
+    #toast { margin-top:10px; color:#b91c1c; min-height:18px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>JUNE — Library Assistant</h2>
+    <p>Sign in with your register number to start chatting.</p>
+    <input id="reg" placeholder="Register number" />
+    <button id="login" type="button">Login</button>
+    <div id="toast"></div>
+  </div>
+
+  <script>
+    // Backend base (production)
+    const API_BASE = 'https://api.june.eec.com';  // e.g., https://api.june.example.com
+
+    const regEl = document.getElementById('reg');
+    const loginBtn = document.getElementById('login');
+    const toast = document.getElementById('toast');
+
+    function show(t){ toast.textContent = t || ""; }
+    loginBtn.addEventListener('click', async () => {
+      const reg_no = regEl.value.trim();
+      if (!reg_no){ show("Enter your register number"); return; }
+      try{
+        const r = await fetch(`${API_BASE}/api/login`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ reg_no })
+        });
+        const j = await r.json();
+        if (!j.ok){ show(j.msg || "Login failed"); return; }
+        sessionStorage.setItem('reg_no', j.reg_no);
+        sessionStorage.setItem('name', j.name);
+        location.href = '/chat';  // Vercel serves /static as root; chat.html at /chat (backend serves too if running locally)
+      }catch(e){ show("Network error"); }
+    });
+  </script>
+</body>
+</html>
