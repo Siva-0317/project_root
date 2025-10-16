@@ -1,0 +1,8 @@
+{
+  "buildCommand": "",
+  "outputDirectory": "static",
+  "rewrites": [
+    { "source": "/",     "destination": "/login.html" },
+    { "source": "/chat", "destination": "/chat.html" }
+  ]
+}
